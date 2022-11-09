@@ -12,11 +12,15 @@ struct Args {
     #[arg(short, long)]
     input: String,
 
-    // limits how big textures can be
+    /// where to output the damn thing
+    #[arg(short, long)]
+    output: String,
+
+    /// limits how big textures can be
     #[arg(short, long)]
     max_texture_dimensions: u32,
 
-    // limits how big textures can be
+    /// limits how big textures can be
     #[arg(short, long)]
     texture_quality: u32,
 }
@@ -48,10 +52,19 @@ fn main() {
         .zip(&image_data)
         .map(|(image_view, image_data)| {
             let image = gltf_image_to_image_image(image_data);
-            image.resize(
+
+            print!("input texture size: {}x{}, ", image.width(), image.height());
+
+            let image = image.resize(
                 args.max_texture_dimensions,
                 args.max_texture_dimensions,
                 FilterType::Gaussian,
+            );
+
+            println!(
+                "output texture size: {}x{}, ",
+                image.width(),
+                image.height()
             );
 
             let mut buf = Vec::new();
@@ -63,38 +76,74 @@ fn main() {
                 )
                 .unwrap();
 
-            gltf::json::Image {
-                buffer_view: None,
-                uri: Some(format!(
-                    "data:application/octet-stream;base64,{}",
-                    base64::encode(&buf)
-                )),
-                mime_type: Some(MimeType("image/jpeg".into())),
-                name: image_view.name().map(|s| s.into()),
-                extensions: None,
-                extras: image_view.extras().clone(),
-            }
+            let bv = match image_view.source() {
+                gltf::image::Source::View { view, .. } => Some(view),
+                gltf::image::Source::Uri { .. } => None,
+            };
+
+            (
+                gltf::json::Image {
+                    buffer_view: None,
+                    uri: Some(format!(
+                        "data:application/octet-stream;base64,{}",
+                        base64::encode(&buf)
+                    )),
+                    mime_type: Some(MimeType("image/jpeg".into())),
+                    name: image_view.name().map(|s| s.into()),
+                    extensions: None,
+                    extras: image_view.extras().clone(),
+                },
+                bv,
+            )
         });
 
-    let mut root = document.clone().into_json();
-    root.buffers = buffers
-        .iter()
-        .map(|b| -> gltf::json::Buffer {
-            gltf::json::Buffer {
-                byte_length: b.0.len() as u32,
-                name: None,
-                uri: Some(format!(
-                    "data:application/octet-stream;base64,{}",
-                    base64::encode(&b.0)
-                )),
-                extensions: None,
-                extras: gltf::json::extras::Void::default(),
-            }
-        })
+    let excluded_views: Vec<usize> = images
+        .clone()
+        .filter_map(|p| p.1.map(|p| p.index()))
         .collect();
 
-    root.images = images.collect();
+    let views: Vec<gltf::buffer::View> = document
+        .views()
+        .filter(|v| !excluded_views.contains(&v.index()))
+        .collect();
 
-    let mut out = std::fs::File::create("smolinator_output.gltf").unwrap();
+    let mut giga_buffer: Vec<u8> = Vec::new();
+    let mut views_json: Vec<gltf::json::buffer::View> = Vec::new();
+    for view in &views {
+        let start = giga_buffer.len();
+        let buf = &buffers[view.buffer().index()].0;
+        giga_buffer.extend_from_slice(&buf[view.offset()..(view.offset() + view.length())]);
+        let end = giga_buffer.len();
+        let len = end - start;
+
+        views_json.push(gltf::json::buffer::View {
+            buffer: gltf::json::Index::new(0),
+            byte_length: len as u32,
+            byte_offset: Some(start as u32),
+            byte_stride: None,
+            name: None,
+            target: None,
+            extensions: None,
+            extras: gltf::json::extras::Void::default(),
+        });
+    }
+
+    let giga_buffer_json = gltf::json::Buffer {
+        byte_length: giga_buffer.len() as u32,
+        name: None,
+        uri: Some(format!(
+            "data:application/octet-stream;base64,{}",
+            base64::encode(&giga_buffer)
+        )),
+        extensions: None,
+        extras: gltf::json::extras::Void::default(),
+    };
+
+    let mut root = document.clone().into_json();
+    root.buffers = vec![giga_buffer_json];
+    root.images = images.map(|p| p.0).collect();
+    root.buffer_views = views_json;
+
+    let mut out = std::fs::File::create(args.output).unwrap();
     root.to_writer_pretty(&mut out).unwrap();
 }
